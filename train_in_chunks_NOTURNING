@@ -1,0 +1,328 @@
+# Imports:
+import gc
+import orjson as json
+import chess
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pylab as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import StepLR
+
+# These are functions, model and the dataset from other .py files.
+from auxiliary_functions import create_position_planes,  encode_output, turn, best_move_distribution
+from dataset import ChessDataset
+from model import ChessModel,ChessExpert1
+import pickle
+
+
+
+# These are the model's parameters:
+learning_rate = 0.1
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f'Device is: {device}')
+
+model = ChessExpert1().to(device)
+#criterion = nn.CrossEntropyLoss()
+criterion = nn.KLDivLoss(reduction="batchmean") # KL-Divergence for estimating distance between two prob distribution
+
+optimizer = torch.optim.SGD(model.parameters(), lr = learning_rate,momentum=0.94)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,factor=0.1,patience=6,mode='min',verbose=True,min_lr=0.00001)
+
+training_results = []
+test_results = []
+
+# This is the training loop:
+def train_epochs(num_epochs, chunk_number,dataloader,dataloader_test_set):
+    for g in optimizer.param_groups:
+        g['lr'] = learning_rate
+
+    #step_size = 5
+#    scheduler = StepLR(optimizer, step_size=step_size, gamma=0.1)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,factor=0.1,patience=2,mode='min',verbose=True)
+    training_results = []
+    test_results = []
+
+    print(f'Training has started. The number of epochs used: {num_epochs}')
+    for epoch in range(num_epochs):
+
+        model.train() # Turning on training mode...
+
+        running_loss = 0.0
+        for inputs, labels in tqdm(dataloader):
+            inputs,labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+
+            outputs,_ = model(inputs)
+
+            #target = torch.argmax(outputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # preventing exploding gradients...
+
+            optimizer.step()
+
+            running_loss += loss.item()
+
+        #if epoch <= step_size*2:
+            #scheduler.step()
+        
+
+        print(f'Epoch {epoch+1}/{num_epochs}. Training loss: {running_loss/len(dataloader):.4f}')
+        training_results.append(running_loss/len(dataloader))
+
+
+        # For testing on unseen data: ------------
+
+        model.eval() # Turning on evaluation mode...
+
+        test_loss = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():  # Turn off gradients computation
+            for test_inputs, test_labels in dataloader_test_set:
+                test_inputs, test_labels = test_inputs.to(device), test_labels.to(device)
+
+                # Forward pass with mask (mask invalid moves during evaluation)
+                test_outputs,se_outs = model(test_inputs)
+                print(f'These are se_outs 1: { se_outs[0]}')
+
+                # Compute loss on the test set
+                loss = criterion(test_outputs, test_labels)
+                test_loss += loss.item()
+
+                # Apply argmax to get the predicted class
+                # test_outputs = torch.argmax(test_outputs, dim=0)
+
+                # Compare predictions with true labels
+            #   if test_outputs.sum() == test_labels.sum():
+                #  correct += 1
+        #       total += test_labels.size(0)
+
+        #accuracy = 100 * correct / len(dataloader_test_set)
+        avg_test_loss = test_loss / len(dataloader_test_set)
+        #Accuracy = {accuracy:.4f}%
+        print(f'Epoch {epoch+1}/{num_epochs}. Test loss: {avg_test_loss:.4f}.')
+        test_results.append(avg_test_loss)
+    
+        scheduler.step(avg_test_loss)
+        curr_lr = optimizer.param_groups[0]['lr']
+        print(f'Current learning rate is:{curr_lr}.')
+    print(f'The training for this chunk has ended. Chunk completion: {chunk_number+1} / {number_of_chunks}')
+
+def attacked_squares_map(board, TURN):
+    # Initialize an 8x8 grid of zeros
+    attacked_map = np.zeros((8, 8), dtype=int)
+    
+    if TURN:
+        color = color=chess.WHITE
+    else:
+        color = color=chess.BLACK
+
+
+    # Loop over all squares on the board (0 to 63)
+    for square in chess.SQUARES:
+        # Check if the square is attacked by any of your pieces
+        if board.is_attacked_by(color, square):
+            # Convert the square (0 to 63) to 8x8 coordinates (rank, file)
+            row, col = divmod(square, 8)
+            # Mark as attacked
+            attacked_map[row, col] = 1
+    
+    return attacked_map
+
+def create_position_planes(position):
+    board = chess.Board(position)
+
+    # Check if we need to turn the board
+    turned = False
+
+    # Create planes for 12 types of pieces (6 for each side)
+    planes = np.zeros((14, 8, 8), dtype=np.int8)
+
+    from_pieces = np.zeros((8,8))
+    
+    attacked_map = attacked_squares_map(board,board.turn)
+    planes[12] = attacked_map
+    # Mapping chess pieces to plane indices
+    piece_map = {
+        'K': 0, 'Q': 1, 'R': 2, 'B': 3, 'N': 4, 'P': 5,
+        'k': 6, 'q': 7, 'r': 8, 'b': 9, 'n': 10, 'p': 11
+    }
+
+    # Efficient iteration over the board
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece:
+            row, col = divmod(square, 8)  # Get row and column from square index
+
+            plane_idx = piece_map[piece.symbol()]
+            planes[plane_idx, row, col] = 1
+    
+    if board.turn:
+        from_pieces = np.sum(planes[0:6], axis=0)
+    else:
+        from_pieces = np.sum(planes[6:12], axis=0)
+    
+    planes[13] = from_pieces
+
+
+    return planes, turned
+
+def transform_data(positions):    
+    # Here I create X and y
+    X , y = [],[]
+
+    for i,position in tqdm(enumerate(positions)):
+        state,_ = create_position_planes(position['fen'])
+
+        X.append(state)
+
+        if 'w' == position['fen'].split(" ")[1]:
+            moves,probs = best_move_distribution(position,True)
+        else:
+            moves,probs = best_move_distribution(position,False)
+
+        best_move_state = np.zeros((64,8,8),dtype=np.float32)
+
+        for idx,move in enumerate(moves):
+            best_move_state = encode_output(move,best_move_state,probs[idx])
+
+
+        y.append(best_move_state.reshape(64*8*8))
+
+    # Transforming X and y into tensors:
+    X = torch.tensor(np.asarray(X,dtype=np.float32),dtype=torch.float32)
+    y = torch.tensor(np.asarray(y,dtype=np.float32),dtype=torch.float32)
+    return X,y
+
+def train_one_epoch(dataloader,dataloader_test_set):
+
+    model.train() # Turning on training mode...
+
+    running_loss = 0.0
+    for inputs, labels in tqdm(dataloader):
+        inputs,labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs,_ = model(inputs)
+
+        # For KL-div part:
+        outputs = F.log_softmax(outputs,dim=1)
+        loss = criterion(outputs, labels)
+        loss.backward()
+
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # preventing exploding gradients...
+
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    training_results.append(running_loss/len(dataloader))
+
+    # For testing on unseen data: ------------
+
+    model.eval() # Turning on evaluation mode...
+
+    test_loss = 0.0
+    with torch.no_grad():  # Turn off gradients computation
+        for test_inputs, test_labels in dataloader_test_set:
+            test_inputs, test_labels = test_inputs.to(device), test_labels.to(device)
+
+            # Forward pass with mask (mask invalid moves during evaluation)
+            test_outputs,se_outs = model(test_inputs)
+    
+
+
+            # Compute loss on the test set
+            # For KL-div part:
+            test_outputs = F.log_softmax(test_outputs,dim=1)
+            loss = criterion(test_outputs, test_labels)
+            test_loss += loss.item()
+
+    SE_Out = se_outs[0].flatten()
+    print(f'These are se_outs 1: {SE_Out}')
+    avg_test_loss = test_loss / len(dataloader_test_set)
+    test_results.append(avg_test_loss)
+    print(['lr:',scheduler.get_last_lr()])
+
+    scheduler.step(avg_test_loss)
+
+# This function opens the jsonl file and reads in in chunks:
+def train_chunks(epoch,number_of_chunks):
+    for processed_idx in range(number_of_chunks):
+        file_path = 'data/' + str(processed_idx) + '.pkl'
+
+        with open(file_path, 'rb') as file:
+            dataloader_train = pickle.load(file)
+
+        file_path = 'data/' + str(processed_idx) + '_test.pkl'
+        with open(file_path, 'rb') as file:
+            dataloader_test = pickle.load(file)
+        
+        train_one_epoch(dataloader_train,dataloader_test)
+        print(f'At Epoch {epoch} in Chunk {processed_idx+1}/{number_of_chunks}. Training loss: {training_results[-1]}. Testing loss: {test_results[-1]}')
+
+
+def save_data_in_chunks(file_path,max_chunks,chunk_size=1_000_000,batch_size = 512*2):
+    processed_idx = 0
+    with open(file_path, 'r', encoding='utf-8') as file:
+        positions = []
+        for i, line in tqdm(enumerate(file)):
+            if i <= processed_idx*chunk_size:
+                continue
+            if processed_idx > max_chunks:
+                print('Processed all the chunks...')
+                break
+
+            positions.append(json.loads(line))
+
+            if len(positions) >= chunk_size:
+                X,y = transform_data(positions)
+
+                cut = 128*5
+                dataset = ChessDataset(X[:-cut],y[:-cut])
+                dataset_test = ChessDataset(X[-cut:],y[-cut:])
+                
+                # Creating dataloader for it:
+                dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = True)
+                dataloader_test = DataLoader(dataset_test, batch_size = batch_size, shuffle = True)
+
+                with open('data/'+str(processed_idx)+'.pkl', 'wb') as f:
+                    pickle.dump(dataloader, f)
+
+                with open('data/'+str(processed_idx)+'_test.pkl', 'wb') as f:
+                    pickle.dump(dataloader_test, f)
+
+                del X, y, dataset, dataloader  # Remove references to large data
+                gc.collect()  # Force garbage collection
+
+                processed_idx += 1
+                positions = []
+                print(f'Saved chunk {processed_idx}/{max_chunks}.')
+
+chunk_size = 1_500_000
+number_of_chunks = 80_000_000 // chunk_size
+number_of_chunks = 20
+
+
+filename = 'lichess_db_eval.jsonl'
+#save_data_in_chunks(filename,number_of_chunks,8000,128)
+# In this loop I index which chunk should be loaded in
+epochs = 10
+for epoch in range(epochs):
+    print(f'Epoch {epoch+1}/{epochs}. ---------------------------------------------------------------------')
+    
+    train_chunks(epoch+1,number_of_chunks)
+
+
+'''
+Important Note:
+"Consider providing target as class probabilities only
+when a single class label per minibatch item is too restrictive."
+'''
